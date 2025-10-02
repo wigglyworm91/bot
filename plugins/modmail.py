@@ -38,9 +38,7 @@ from util.discord import (
     PartialChannelConverter,
     PartialGuildConverter,
     PartialRoleConverter,
-    PlainItem,
     UserError,
-    chunk_messages,
     format,
     retry,
 )
@@ -103,6 +101,7 @@ message_map: Dict[int, ModmailMessage] = {}
 
 @plugins.init
 async def init() -> None:
+    logger.debug(f'modmail plugin initialising')
     await util.db.init(util.db.get_ddl(CreateSchema("modmail"), registry.metadata.create_all))
 
     async with sessionmaker() as session:
@@ -147,12 +146,16 @@ class ModMailClient(Client):
 
     async def on_ready(self) -> None:
         await self.change_presence(activity=Activity(type=ActivityType.watching, name="DMs"))
+        logger.info(f'modmail listening for DMs')
 
     async def on_error(self, event_method: str, *args: object, **kwargs: object) -> None:
         logger.error("Exception in modmail client {}".format(event_method), exc_info=True)
 
     async def on_message(self, msg: Message) -> None:
         if not msg.guild and self.user is not None and msg.author.id != self.user.id:
+            logger.debug(f'modmail received DM')
+
+            # look up modmail channel and ping role
             try:
                 guild = bot.client.client.get_guild(self.conf.guild_id)
                 if guild is None:
@@ -166,21 +169,29 @@ class ModMailClient(Client):
             except (ValueError, AttributeError):
                 return
             thread_id = await update_thread(self.conf, msg.author.id)
+            logger.debug(f'modmail found {thread_id=!r}')
 
-            items = [PlainItem(msg.content)]
+            # was the DM in reply to any message?
+            reference: Optional[MessageReference] = None
+            if msg.reference is not None:
+                # attempt to look up the referenced message so threading can make some sense
+                referenced_dm_id = msg.reference.message_id
+                async with sessionmaker() as session:
+                    stmt = (
+                        # There should be two staff messages associated with this DM -- the header and the content message itself.
+                        # We'd prefer to reference the content message, so we order by message id DESC under the assumption that message IDs are increasing
+                        #  but if there's only one relevant staff message, then we'll use whatever we can find
+                        select(ModmailMessage.staff_message_id)
+                        .where(ModmailMessage.dm_message_id == referenced_dm_id)
+                        .order_by(ModmailMessage.staff_message_id.desc())
+                        .limit(1)
+                    )
+                    result = await session.execute(stmt)
+                referenced_staff_msg_id = result.scalar_one_or_none()
+                if referenced_staff_msg_id is not None:
+                    reference = MessageReference(message_id=referenced_staff_msg_id, channel_id=channel.id, fail_if_not_exists=False)
 
-            footer = "".join("\n**Attachment:** {} {}".format(att.filename, att.url) for att in msg.attachments)
-            if thread_id is None:
-                footer += format("\n{!m}", role)
-            if footer:
-                items.append(PlainItem("\n" + footer))
-
-            mentions = AllowedMentions.none()
-            mentions.roles = [role]
-            reference = None
-            if thread_id is not None:
-                reference = MessageReference(message_id=thread_id, channel_id=channel.id, fail_if_not_exists=False)
-
+            # create an embed describing when the message was sent and who sent it
             embed = (
                 discord.Embed(
                     title=format("Modmail from {}#{}", msg.author.name, msg.author.discriminator),
@@ -189,17 +200,32 @@ class ModMailClient(Client):
                 .add_field(name="From", value=format("{!m}", msg.author))
                 .add_field(name="ID", value=msg.author.id)
             )
+
+            # construct the header message: include the embed and possibly ping the modmail role
+            mentions = AllowedMentions.none()
+            if thread_id is None:
+                # no active thread -> we should alert the modmail role
+                content = format('{!m}', role)
+                mentions.roles = [role]
+            else:
+                content = None
+            
+            # send the header message and update the thread
             if reference is not None:
                 header = await retry(
-                    lambda: channel.send(embed=embed, allowed_mentions=mentions, reference=reference), attempts=10
+                    lambda: channel.send(content=content, embed=embed, allowed_mentions=mentions, reference=reference), 
+                    attempts=10
                 )
             else:
-                header = await retry(lambda: channel.send(embed=embed, allowed_mentions=mentions), attempts=10)
+                header = await retry(
+                    lambda: channel.send(content=content, embed=embed, allowed_mentions=mentions), 
+                    attempts=10
+                )
             await add_modmail(msg, header)
 
-            for content, _ in chunk_messages(items):
-                copy = await retry(lambda: channel.send(content, allowed_mentions=mentions), attempts=10)
-                await add_modmail(msg, copy)
+            # forward the DM itself to the modmail channel
+            copy = await msg.forward(channel)
+            await add_modmail(msg, copy)
 
             if thread_id is None:
                 await create_thread(msg.author.id, header.id)
@@ -247,30 +273,33 @@ class Modmail(Cog):
         await query.delete()
         if result is None:
             await msg.channel.send("Cancelled")
-        else:
-            items = []
-            if result == "named":
-                items.append(PlainItem(format("**From {}** {!m}:\n\n", msg.author.display_name, msg.author)))
-            items.append(PlainItem(msg.content))
-            for att in msg.attachments:
-                items.append(PlainItem("\n**Attachment:** {}".format(att.url)))
+            return
+        
+        try:
+            dm_channel = await client.fetch_channel(modmail.dm_channel_id)
+            if not isinstance(dm_channel, DMChannel):
+                await msg.channel.send("Could not deliver DM (DM closed)")
+                return
+            
+            if result == 'named':
+                # send signature to user
+                signature = format('**From {}** {!m}', msg.author.display_name, msg.author)
+                dm_signature = await dm_channel.send(
+                    signature,
+                    reference=MessageReference(
+                        message_id=modmail.dm_message_id, channel_id=modmail.dm_channel_id, fail_if_not_exists=False
+                    ),
+                )
+                await add_modmail(dm_signature, msg)
+            
+            # forward actual message to user and add to database
+            dm_message = await msg.forward(dm_channel, fail_if_not_exists=True)
+            await add_modmail(dm_message, msg)
 
-            try:
-                chan = await client.fetch_channel(modmail.dm_channel_id)
-                if not isinstance(chan, DMChannel):
-                    await msg.channel.send("Could not deliver DM (DM closed)")
-                    return
-                for content, _ in chunk_messages(items):
-                    await chan.send(
-                        content,
-                        reference=MessageReference(
-                            message_id=modmail.dm_message_id, channel_id=modmail.dm_channel_id, fail_if_not_exists=False
-                        ),
-                    )
-            except (discord.NotFound, discord.Forbidden):
-                await msg.channel.send("Could not deliver DM (User left guild?)")
-            else:
-                await msg.channel.send("Signed reply delivered" if result == "named" else "Anonymous reply delivered")
+        except (discord.NotFound, discord.Forbidden):
+            await msg.channel.send("Could not deliver DM (User left guild?)")
+        else:
+            await msg.channel.send("Signed reply delivered" if result == "named" else "Anonymous reply delivered")
 
 
 clients: Dict[int, ModMailClient] = {}
